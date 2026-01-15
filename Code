@@ -867,7 +867,7 @@ def main():
                 model, val_loader, device
             )
 
-            # ✅ FIX: FD-head metrics are meaningless at λ=0 → set to NaN for clean plots
+            # FD-head metrics are meaningless at λ=0 → set to NaN for clean plots
             if lam == 0.0:
                 val_fdhead_r2_pred = np.nan
 
@@ -941,7 +941,7 @@ def main():
             save_comp_dir=test_comp_dir
         )
 
-        # ✅ FIX: FD-head test metric meaningless at λ=0
+        # FD-head test metric meaningless at λ=0
         if lam == 0.0:
             test_fdhead_r2_pred = np.nan
 
@@ -963,7 +963,7 @@ def main():
             ylabel="FD difference (PredMask - GT)"
         )
 
-        # ✅ Skip FD-head plots at λ=0 (clean baseline)
+        # Skip FD-head plots at λ=0 (clean baseline)
         head_stats = None
         if lam > 0:
             head_stats = scatter_regression_plot(
