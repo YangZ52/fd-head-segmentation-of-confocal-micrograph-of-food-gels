@@ -1,0 +1,1042 @@
+# ============================================================
+# ONE-SHOT TRAIN + EVAL (λ sweep) — ResNet34 U-Net + (CBAM/SE) + FD head
+# when λFD = 0 (segmentation only)
+#   - FD loss is NOT computed (reported as 0)
+#   - FD head parameters are frozen (no training / no drift)
+#   - FD-head R² metrics are set to NaN (clean plots/tables)
+#
+# Calculation of R²:
+#   - R²_pred  = r2_score(GT, Pred)        (identity fidelity vs y=x)
+#   - R²_fit   = r2_score(Pred, a*GT+b)    (goodness of linear fit)
+#   - r²       = Pearson correlation squared
+#
+# Notebook display:
+#   - After each λ finishes training:
+#       (1) training curves shown inline
+#       (2) TEST correlation plots (FD mask + FD head) shown inline
+#       (3) Bland–Altman plots shown inline
+#   - All figures + CSVs saved to disk
+# ============================================================
+
+import os, math, random
+from dataclasses import dataclass
+from datetime import datetime
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import models
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Notebook inline display (safe even if not in notebook)
+try:
+    from IPython.display import display
+except Exception:
+    display = None
+
+
+# =========================
+# CONFIG (EDIT PATHS HERE)
+# =========================
+@dataclass
+class CFG:
+    # --- TRAIN paths ---
+    train_images_dir: str = "/Users/zhiy/OneDrive/Protein_Gel_AI_Project/confocal_dataset/train/resized_images"
+    train_masks_dir:  str = "/Users/zhiy/OneDrive/Protein_Gel_AI_Project/confocal_dataset/train/resized_masks"
+
+    # --- TEST paths ---
+    test_images_dir: str = "/Users/zhiy/OneDrive/Protein_Gel_AI_Project/confocal_dataset/test/resized_images1230"
+    test_masks_dir:  str = "/Users/zhiy/OneDrive/Protein_Gel_AI_Project/confocal_dataset/test/resized_masks1230"
+
+    # --- Output root ---
+    out_root: str = "/Users/zhiy/OneDrive/Protein_Gel_AI_Project/confocal_dataset/results"
+    run_name: str = "mtl_resnet34_cbam_seg_fd_with_fdhead_eval"
+
+    # --- Data ---
+    image_exts: tuple = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+    patch_size: int = 256
+    patches_per_image: int = 16
+    min_fg_frac: float = 0.02
+    max_tries: int = 30
+    val_ratio_images: float = 0.15  # split by IMAGE (not patch)
+
+    # --- Normalization ---
+    norm_mean: float = 0.5
+    norm_std: float = 0.5
+
+    # --- FD box scales ---
+    box_scales: tuple = (8, 12, 16, 24, 32, 48, 64)
+
+    # --- Training ---
+    epochs: int = 200
+    batch_size: int = 8
+    lr: float = 2e-4
+    weight_decay: float = 1e-4
+    num_workers: int = 0  # Windows CUDA: try 2–8 if stable
+
+    seed: int = 42
+
+    # Scheduler
+    scheduler: str = "cosine"  # "cosine" or "plateau"
+    cosine_tmax: int = 300
+
+    # Loss
+    seg_bce_weight: float = 0.5
+    seg_dice_weight: float = 0.5
+    fd_loss_type: str = "huber"  # "mse" or "huber"
+    huber_delta: float = 0.10
+
+    # λ sweep
+    lambda_list: tuple = (0.0, 0.05, 0.1, 0.2, 0.5, 1.0)
+
+    # Model
+    pretrained: bool = True
+    dropout: float = 0.2
+    attention: str = "cbam"  # "cbam" or "se"
+
+    # Device
+    use_mps_if_available: bool = True
+
+    # Save best model by:
+    save_best_by: str = "dice"  # "dice" or "fdmask_r2_pred" or "fdhead_r2_pred"
+
+    # Evaluation threshold
+    prob_threshold: float = 0.5
+
+
+cfg = CFG()
+
+
+# =========================
+# UTILITIES
+# =========================
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def get_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if cfg.use_mps_if_available and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def ensure_dir(p): os.makedirs(p, exist_ok=True)
+
+
+def list_files(folder, exts):
+    fs = [f for f in os.listdir(folder) if f.lower().endswith(exts)]
+    fs.sort()
+    return fs
+
+
+def _base_no_ext(name: str) -> str:
+    return os.path.splitext(os.path.basename(name))[0]
+
+
+def find_mask_for_image(img_filename: str, masks_dir: str):
+    base = _base_no_ext(img_filename)
+    candidates = [
+        f"{base}_fiji_mask.png",
+        f"{base}_mask.png",
+        f"{base}_test_mask.png",
+        f"{base}_test_test_mask.png",
+        f"{base}_gt_mask.png",
+        f"{base}.png", f"{base}.jpg", f"{base}.jpeg",
+    ]
+    for c in candidates:
+        p = os.path.join(masks_dir, c)
+        if os.path.exists(p): return p
+    for f in os.listdir(masks_dir):
+        if base in f:
+            return os.path.join(masks_dir, f)
+    return None
+
+
+def pil_to_gray_tensor(img_pil: Image.Image) -> torch.Tensor:
+    arr = np.array(img_pil, dtype=np.float32)
+    if arr.ndim == 2:
+        arr = arr[None, :, :]
+    else:
+        if arr.shape[2] >= 3:
+            r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+            arr = (0.2989*r + 0.5870*g + 0.1140*b)[None, :, :]
+        else:
+            arr = arr[:, :, 0][None, :, :]
+    arr = arr / 255.0
+    t = torch.from_numpy(arr)  # 1xHxW
+    t = (t - cfg.norm_mean) / cfg.norm_std
+    return t
+
+
+def pil_mask_to_binary(mask_pil: Image.Image) -> np.ndarray:
+    m = np.array(mask_pil.convert("L"), dtype=np.uint8)
+    return (m > 127).astype(np.uint8)  # 1=protein, 0=pore
+
+
+# =========================
+# FD (BOX COUNTING)
+# =========================
+def boxcount(Z: np.ndarray, k: int) -> int:
+    H, W = Z.shape
+    Hc = (H // k) * k
+    Wc = (W // k) * k
+    Z = Z[:Hc, :Wc]
+    if Hc == 0 or Wc == 0: return 0
+    S = Z.reshape(Hc // k, k, Wc // k, k)
+    block_sums = S.sum(axis=(1, 3))
+    return int(np.count_nonzero(block_sums > 0))
+
+
+def fractal_dimension_boxcount(Z: np.ndarray, scales: tuple) -> float:
+    Z = Z.astype(np.uint8)
+    H, W = Z.shape
+    max_scale = min(H, W)
+    ss = sorted(set([s for s in scales if 2 <= s <= max_scale]))
+    if len(ss) < 2: return float("nan")
+
+    Ns, Ss = [], []
+    for s in ss:
+        n = boxcount(Z, s)
+        if n > 0:
+            Ns.append(n); Ss.append(s)
+    if len(Ns) < 2: return float("nan")
+
+    x = np.log(1.0 / np.array(Ss, dtype=np.float64))
+    y = np.log(np.array(Ns, dtype=np.float64))
+    a, b = np.polyfit(x, y, 1)
+    return float(a)
+
+
+# =========================
+# CORRELATION METRICS (CORRECT)
+# =========================
+def r2_score_np(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+    m = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true, y_pred = y_true[m], y_pred[m]
+    if len(y_true) < 2: return np.nan
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    if ss_tot == 0: return np.nan
+    return float(1.0 - ss_res / ss_tot)
+
+
+def linfit_np(x, y):
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    if len(x) < 2: return np.nan, np.nan
+    a, b = np.polyfit(x, y, 1)
+    return float(a), float(b)
+
+
+def pearson_r2(x, y):
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    if len(x) < 2: return np.nan
+    r = np.corrcoef(x, y)[0, 1]
+    return float(r * r)
+
+
+# =========================
+# DATASETS
+# =========================
+def build_pairs(images_dir, masks_dir):
+    imgs = list_files(images_dir, cfg.image_exts)
+    image_paths, mask_paths = [], []
+    for im in imgs:
+        mp = find_mask_for_image(im, masks_dir)
+        if mp is None: continue
+        image_paths.append(os.path.join(images_dir, im))
+        mask_paths.append(mp)
+    if len(image_paths) == 0:
+        raise RuntimeError(f"No image-mask pairs found in {images_dir} / {masks_dir}. Check paths + naming.")
+    return image_paths, mask_paths
+
+
+def split_by_image(image_paths, mask_paths, val_ratio, seed):
+    n = len(image_paths)
+    idx = list(range(n))
+    random.Random(seed).shuffle(idx)
+    n_val = max(1, int(n * val_ratio))
+    val_idx = idx[:n_val]
+    tr_idx = idx[n_val:]
+    tr_imgs = [image_paths[i] for i in tr_idx]
+    tr_msks = [mask_paths[i] for i in tr_idx]
+    va_imgs = [image_paths[i] for i in val_idx]
+    va_msks = [mask_paths[i] for i in val_idx]
+    return tr_imgs, tr_msks, va_imgs, va_msks
+
+
+class TrainPatchDataset(Dataset):
+    def __init__(self, image_paths, mask_paths, patch_size, patches_per_image):
+        self.image_paths = image_paths
+        self.mask_paths = mask_paths
+        self.patch_size = patch_size
+        self.patches_per_image = patches_per_image
+
+    def __len__(self):
+        return len(self.image_paths) * self.patches_per_image
+
+    def __getitem__(self, idx):
+        i = idx // self.patches_per_image
+        img_path = self.image_paths[i]
+        msk_path = self.mask_paths[i]
+
+        img = Image.open(img_path).convert("RGB")
+        msk = Image.open(msk_path).convert("L")
+
+        if img.size != msk.size:
+            msk = msk.resize(img.size, Image.NEAREST)
+
+        W, H = img.size
+        ps = self.patch_size
+
+        if W < ps or H < ps:
+            newW = max(W, ps); newH = max(H, ps)
+            img = img.resize((newW, newH), Image.BILINEAR)
+            msk = msk.resize((newW, newH), Image.NEAREST)
+            W, H = img.size
+
+        for _ in range(cfg.max_tries):
+            x0 = random.randint(0, W - ps)
+            y0 = random.randint(0, H - ps)
+            img_p = img.crop((x0, y0, x0 + ps, y0 + ps))
+            msk_p = msk.crop((x0, y0, x0 + ps, y0 + ps))
+
+            mb = pil_mask_to_binary(msk_p)
+            if float(mb.mean()) >= cfg.min_fg_frac:
+                fd = fractal_dimension_boxcount(mb, cfg.box_scales)
+                if np.isfinite(fd):
+                    x = pil_to_gray_tensor(img_p)
+                    y_mask = torch.from_numpy(mb[None, :, :].astype(np.float32))
+                    y_fd = torch.tensor([fd], dtype=torch.float32)
+                    return x, y_mask, y_fd
+
+        # fallback
+        x0 = random.randint(0, W - ps)
+        y0 = random.randint(0, H - ps)
+        img_p = img.crop((x0, y0, x0 + ps, y0 + ps))
+        msk_p = msk.crop((x0, y0, x0 + ps, y0 + ps))
+        mb = pil_mask_to_binary(msk_p)
+        fd = fractal_dimension_boxcount(mb, cfg.box_scales)
+        if not np.isfinite(fd): fd = 0.0
+        x = pil_to_gray_tensor(img_p)
+        y_mask = torch.from_numpy(mb[None, :, :].astype(np.float32))
+        y_fd = torch.tensor([fd], dtype=torch.float32)
+        return x, y_mask, y_fd
+
+
+class FullImageDataset(Dataset):
+    def __init__(self, image_paths, mask_paths):
+        self.image_paths = image_paths
+        self.mask_paths = mask_paths
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        msk_path = self.mask_paths[idx]
+
+        img = Image.open(img_path).convert("RGB")
+        msk = Image.open(msk_path).convert("L")
+        if img.size != msk.size:
+            msk = msk.resize(img.size, Image.NEAREST)
+
+        mb = pil_mask_to_binary(msk)
+        fd = fractal_dimension_boxcount(mb, cfg.box_scales)
+        if not np.isfinite(fd): fd = 0.0
+
+        x = pil_to_gray_tensor(img)
+        y_mask = torch.from_numpy(mb[None, :, :].astype(np.float32))
+        y_fd = torch.tensor([fd], dtype=torch.float32)
+        name = _base_no_ext(img_path)
+        return x, y_mask, y_fd, name
+
+
+# =========================
+# LOSSES / METRICS
+# =========================
+def dice_loss_from_logits(logits, y_true, eps=1e-7):
+    prob = torch.sigmoid(logits)
+    intersection = (prob * y_true).sum(dim=(2, 3))
+    denom = prob.sum(dim=(2, 3)) + y_true.sum(dim=(2, 3))
+    dice = (2 * intersection + eps) / (denom + eps)
+    return 1 - dice.mean()
+
+
+def seg_loss(logits, y_true):
+    bce = F.binary_cross_entropy_with_logits(logits, y_true)
+    dl = dice_loss_from_logits(logits, y_true)
+    return cfg.seg_bce_weight * bce + cfg.seg_dice_weight * dl
+
+
+def fd_loss(pred_fd, true_fd):
+    if cfg.fd_loss_type.lower() == "mse":
+        return F.mse_loss(pred_fd, true_fd)
+    return F.huber_loss(pred_fd, true_fd, delta=cfg.huber_delta)
+
+
+@torch.no_grad()
+def dice_iou_from_logits(logits, y_true, thr=0.5, eps=1e-7):
+    prob = torch.sigmoid(logits)
+    pred = (prob > thr).float()
+    intersection = (pred * y_true).sum(dim=(2, 3))
+    union = (pred + y_true - pred * y_true).sum(dim=(2, 3))
+    dice = (2 * intersection + eps) / (pred.sum(dim=(2, 3)) + y_true.sum(dim=(2, 3)) + eps)
+    iou = (intersection + eps) / (union + eps)
+    return dice.mean().item(), iou.mean().item()
+
+
+# =========================
+# ATTENTION BLOCKS
+# =========================
+class SEBlock(nn.Module):
+    def __init__(self, ch, r=16):
+        super().__init__()
+        self.fc1 = nn.Linear(ch, ch // r)
+        self.fc2 = nn.Linear(ch // r, ch)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        s = x.mean(dim=(2, 3))
+        s = F.relu(self.fc1(s))
+        s = torch.sigmoid(self.fc2(s)).view(b, c, 1, 1)
+        return x * s
+
+
+class CBAM(nn.Module):
+    def __init__(self, ch, r=16, k=7):
+        super().__init__()
+        self.mlp1 = nn.Linear(ch, ch // r)
+        self.mlp2 = nn.Linear(ch // r, ch)
+        self.conv = nn.Conv2d(2, 1, kernel_size=k, padding=k // 2, bias=False)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        avg = x.mean(dim=(2, 3))
+        mx = x.amax(dim=(2, 3))
+        a1 = self.mlp2(F.relu(self.mlp1(avg)))
+        a2 = self.mlp2(F.relu(self.mlp1(mx)))
+        ca = torch.sigmoid(a1 + a2).view(b, c, 1, 1)
+        x = x * ca
+
+        avg2 = x.mean(dim=1, keepdim=True)
+        mx2 = x.amax(dim=1, keepdim=True)
+        sa = torch.sigmoid(self.conv(torch.cat([avg2, mx2], dim=1)))
+        x = x * sa
+        return x
+
+
+# =========================
+# MODEL: ResNet34 U-Net + FD head
+# =========================
+class ConvBNReLU(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x): return self.block(x)
+
+
+class UpBlock(nn.Module):
+    def __init__(self, in_ch, skip_ch, out_ch):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
+        self.conv = ConvBNReLU(out_ch + skip_ch, out_ch)
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        if x.shape[-2:] != skip.shape[-2:]:
+            diffY = skip.size(-2) - x.size(-2)
+            diffX = skip.size(-1) - x.size(-1)
+            x = F.pad(x, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
+        x = torch.cat([skip, x], dim=1)
+        return self.conv(x)
+
+
+class ResNet34AttnUNetFD(nn.Module):
+    def __init__(self, pretrained=True, attention="cbam", dropout=0.2):
+        super().__init__()
+        backbone = models.resnet34(weights=models.ResNet34_Weights.DEFAULT if pretrained else None)
+
+        # first conv to 1-channel
+        w = backbone.conv1.weight.data
+        backbone.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        backbone.conv1.weight.data = w.mean(dim=1, keepdim=True)
+
+        self.enc0 = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu)  # 64, H/2
+        self.pool0 = backbone.maxpool                                          # H/4
+        self.enc1 = backbone.layer1                                            # 64, H/4
+        self.enc2 = backbone.layer2                                            # 128, H/8
+        self.enc3 = backbone.layer3                                            # 256, H/16
+        self.enc4 = backbone.layer4                                            # 512, H/32
+
+        self.attn = SEBlock(512, r=16) if attention.lower() == "se" else CBAM(512, r=16, k=7)
+
+        self.up3 = UpBlock(512, 256, 256)
+        self.up2 = UpBlock(256, 128, 128)
+        self.up1 = UpBlock(128, 64, 64)
+
+        self.up0 = nn.ConvTranspose2d(64, 64, kernel_size=2, stride=2)
+        self.dec0 = ConvBNReLU(64 + 64, 64)
+
+        self.seg_head = nn.Conv2d(64, 1, kernel_size=1)
+
+        # FD head
+        self.fd_pool = nn.AdaptiveAvgPool2d(1)
+        self.fd_drop = nn.Dropout(dropout)
+        self.fd_head = nn.Linear(512, 1)
+
+    def forward(self, x):
+        x0 = self.enc0(x)
+        x1 = self.enc1(self.pool0(x0))
+        x2 = self.enc2(x1)
+        x3 = self.enc3(x2)
+        x4 = self.enc4(x3)
+        x4 = self.attn(x4)
+
+        fd_feat = self.fd_pool(x4).flatten(1)
+        fd_pred = self.fd_head(self.fd_drop(fd_feat))
+
+        d3 = self.up3(x4, x3)
+        d2 = self.up2(d3, x2)
+        d1 = self.up1(d2, x1)
+
+        u0 = self.up0(d1)
+        if u0.shape[-2:] != x0.shape[-2:]:
+            diffY = x0.size(-2) - u0.size(-2)
+            diffX = x0.size(-1) - u0.size(-1)
+            u0 = F.pad(u0, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
+
+        d0 = self.dec0(torch.cat([x0, u0], dim=1))
+        seg_logits = self.seg_head(d0)
+        seg_logits = F.interpolate(seg_logits, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        return seg_logits, fd_pred
+
+
+# =========================
+# SCHEDULER
+# =========================
+def make_scheduler(optimizer):
+    if cfg.scheduler.lower() == "plateau":
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=10)
+    return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.cosine_tmax)
+
+
+# =========================
+# PLOTS (SAVE + DISPLAY)
+# =========================
+def _show_fig_if_notebook():
+    if display is not None:
+        display(plt.gcf())
+
+
+def scatter_regression_plot(x_true, y_pred, title, xlabel, ylabel, out_path=None, show=True):
+    x = np.asarray(x_true, dtype=np.float64).reshape(-1)
+    y = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    if len(x) < 2:
+        return None
+
+    a, b = linfit_np(x, y)
+    y_fit = a * x + b
+
+    r2_pred = r2_score_np(x, y)       # identity fidelity
+    r2_fit  = r2_score_np(y, y_fit)   # regression goodness
+    r2_pear = pearson_r2(x, y)
+
+    xx = np.linspace(x.min(), x.max(), 200)
+    yy = a * xx + b
+
+    plt.figure(figsize=(6,5))
+    plt.scatter(x, y)
+    plt.plot(xx, xx)    # y=x
+    plt.plot(xx, yy)    # regression
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(f"{title}\nFit: y={a:.3f}x+{b:.3f} | R²_fit={r2_fit:.3f} | R²_pred={r2_pred:.3f} | r²={r2_pear:.3f}")
+    plt.tight_layout()
+
+    if out_path is not None:
+        ensure_dir(os.path.dirname(out_path))
+        plt.savefig(out_path, dpi=300)
+
+    if show:
+        _show_fig_if_notebook()
+
+    plt.close()
+
+    return {"a": a, "b": b, "r2_fit": r2_fit, "r2_pred": r2_pred, "r2_pearson": r2_pear, "n": int(len(x))}
+
+
+def bland_altman_plot(x_true, y_pred, title, out_path=None, show=True, ylabel="Difference (Pred - GT)"):
+    x = np.asarray(x_true, dtype=np.float64).reshape(-1)
+    y = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    if len(x) < 2:
+        return None
+
+    mean_xy = 0.5 * (x + y)
+    diff = (y - x)
+    md = float(np.mean(diff))
+    sd = float(np.std(diff, ddof=1)) if len(diff) > 1 else 0.0
+    loa_up = md + 1.96 * sd
+    loa_lo = md - 1.96 * sd
+
+    plt.figure(figsize=(6,5))
+    plt.scatter(mean_xy, diff)
+    plt.axhline(md, linestyle="--")
+    plt.axhline(loa_up, linestyle="--")
+    plt.axhline(loa_lo, linestyle="--")
+    plt.xlabel("Mean of (GT, Pred)")
+    plt.ylabel(ylabel)
+    plt.title(f"{title}\nmean diff={md:.3f}, LoA=[{loa_lo:.3f}, {loa_up:.3f}]")
+    plt.tight_layout()
+
+    if out_path is not None:
+        ensure_dir(os.path.dirname(out_path))
+        plt.savefig(out_path, dpi=300)
+
+    if show:
+        _show_fig_if_notebook()
+
+    plt.close()
+    return {"mean_diff": md, "sd_diff": sd, "loa_low": loa_lo, "loa_high": loa_up, "n": int(len(x))}
+
+
+def plot_training_curves(hist_df, lam, lam_dir, show=True):
+    # Loss curves
+    plt.figure(figsize=(7,4))
+    plt.plot(hist_df["epoch"], hist_df["train_loss_total"], label="train_total")
+    plt.plot(hist_df["epoch"], hist_df["train_loss_seg"], label="train_seg")
+    plt.plot(hist_df["epoch"], hist_df["train_loss_fd"], label="train_fd")
+    plt.xlabel("Epoch"); plt.ylabel("Loss")
+    plt.title(f"Loss Curves | λFD={lam}")
+    plt.legend(); plt.tight_layout()
+    plt.savefig(os.path.join(lam_dir, "loss_curves.png"), dpi=300)
+    if show: _show_fig_if_notebook()
+    plt.close()
+
+    # Seg metrics
+    plt.figure(figsize=(7,4))
+    plt.plot(hist_df["epoch"], hist_df["val_dice"], label="val_dice")
+    plt.plot(hist_df["epoch"], hist_df["val_iou"], label="val_iou")
+    plt.xlabel("Epoch"); plt.ylabel("Score")
+    plt.title(f"Validation Seg Metrics | λFD={lam}")
+    plt.legend(); plt.tight_layout()
+    plt.savefig(os.path.join(lam_dir, "val_seg_curves.png"), dpi=300)
+    if show: _show_fig_if_notebook()
+    plt.close()
+
+    # FD metrics (R²_pred)
+    plt.figure(figsize=(7,4))
+    plt.plot(hist_df["epoch"], hist_df["val_fdmask_r2_pred"], label="val_FDmask_R2_pred")
+    plt.plot(hist_df["epoch"], hist_df["val_fdhead_r2_pred"], label="val_FDhead_R2_pred")
+    plt.xlabel("Epoch"); plt.ylabel("R²_pred")
+    plt.title(f"Validation FD Fidelity (Identity R²) | λFD={lam}")
+    plt.legend(); plt.tight_layout()
+    plt.savefig(os.path.join(lam_dir, "val_fd_r2_pred_curves.png"), dpi=300)
+    if show: _show_fig_if_notebook()
+    plt.close()
+
+
+# =========================
+# TRAIN / EVAL LOOPS
+# =========================
+def train_one_epoch(model, loader, optimizer, device, lambda_fd):
+    """
+    ✅ FIX:
+      - If lambda_fd == 0: do NOT compute FD loss (reported as 0), FD head gets no gradient.
+      - If lambda_fd > 0 : normal MTL (seg + lambda * FD).
+    """
+    model.train()
+    tot, tot_seg, tot_fd = 0.0, 0.0, 0.0
+
+    for x, y_mask, y_fd in loader:
+        x = x.to(device)
+        y_mask = y_mask.to(device)
+        y_fd = y_fd.to(device)
+
+        optimizer.zero_grad(set_to_none=True)
+        seg_logits, fd_pred = model(x)
+
+        Lseg = seg_loss(seg_logits, y_mask)
+
+        if lambda_fd > 0:
+            Lfd = fd_loss(fd_pred, y_fd)
+            L = Lseg + lambda_fd * Lfd
+        else:
+            # clean logging + no FD compute/backprop
+            Lfd = torch.zeros((), device=device)
+            L = Lseg
+
+        L.backward()
+        optimizer.step()
+
+        bs = x.size(0)
+        tot += L.item() * bs
+        tot_seg += Lseg.item() * bs
+        tot_fd += Lfd.item() * bs
+
+    n = len(loader.dataset)
+    return tot / n, tot_seg / n, tot_fd / n
+
+
+@torch.no_grad()
+def eval_on_full_images(model, loader, device, save_pred_dir=None, save_comp_dir=None):
+    """
+    Returns:
+      mean_dice, mean_iou,
+      fdmask_r2_pred, fdhead_r2_pred,
+      df_per_image,
+      lists: fd_gt_all, fd_predmask_all, fd_head_all
+    """
+    model.eval()
+    dice_list, iou_list = [], []
+    fd_gt_all, fd_predmask_all, fd_head_all = [], [], []
+    rows = []
+
+    for x, y_mask, y_fd_gt, name in loader:
+        x = x.to(device)
+        y_mask = y_mask.to(device)
+
+        seg_logits, fd_head_pred = model(x)
+
+        dice, iou = dice_iou_from_logits(seg_logits, y_mask, thr=cfg.prob_threshold)
+        dice_list.append(dice)
+        iou_list.append(iou)
+
+        prob = torch.sigmoid(seg_logits)
+        pred_bin = (prob > cfg.prob_threshold).float()
+
+        pred_np = pred_bin.detach().cpu().numpy()[0, 0].astype(np.uint8) * 255
+        gt_np   = y_mask.detach().cpu().numpy()[0, 0].astype(np.uint8) * 255
+
+        pred_mask_01 = (pred_np > 127).astype(np.uint8)
+        gt_mask_01   = (gt_np   > 127).astype(np.uint8)
+
+        fd_predmask = fractal_dimension_boxcount(pred_mask_01, cfg.box_scales)
+        fd_gt = float(y_fd_gt.detach().cpu().numpy()[0, 0])
+        fd_head = float(fd_head_pred.detach().cpu().numpy()[0, 0])
+
+        fd_gt_all.append(fd_gt if np.isfinite(fd_gt) else np.nan)
+        fd_predmask_all.append(fd_predmask if np.isfinite(fd_predmask) else np.nan)
+        fd_head_all.append(fd_head if np.isfinite(fd_head) else np.nan)
+
+        rows.append({
+            "name": name[0],
+            "dice": dice,
+            "iou": iou,
+            "fd_gt_mask": fd_gt,
+            "fd_pred_mask": float(fd_predmask) if np.isfinite(fd_predmask) else np.nan,
+            "fd_head_pred": fd_head if np.isfinite(fd_head) else np.nan,
+        })
+
+        if save_pred_dir is not None:
+            ensure_dir(save_pred_dir)
+            Image.fromarray(pred_np).save(os.path.join(save_pred_dir, f"{name[0]}_pred_mask.png"))
+
+        if save_comp_dir is not None:
+            ensure_dir(save_comp_dir)
+            x_img = x.detach().cpu()[0, 0].numpy()
+            x_img = (x_img * cfg.norm_std) + cfg.norm_mean
+            x_img = np.clip(x_img, 0, 1)
+            x_img = (x_img * 255).astype(np.uint8)
+
+            canvas = np.zeros((x_img.shape[0], x_img.shape[1] * 3), dtype=np.uint8)
+            canvas[:, 0:x_img.shape[1]] = x_img
+            canvas[:, x_img.shape[1]:2*x_img.shape[1]] = gt_np
+            canvas[:, 2*x_img.shape[1]:3*x_img.shape[1]] = pred_np
+            Image.fromarray(canvas).save(os.path.join(save_comp_dir, f"{name[0]}_img_gt_pred.png"))
+
+    mean_dice = float(np.mean(dice_list)) if dice_list else 0.0
+    mean_iou = float(np.mean(iou_list)) if iou_list else 0.0
+
+    fd_gt_arr = np.asarray(fd_gt_all, dtype=np.float64)
+    fd_pm_arr = np.asarray(fd_predmask_all, dtype=np.float64)
+    fd_h_arr  = np.asarray(fd_head_all, dtype=np.float64)
+
+    m1 = np.isfinite(fd_gt_arr) & np.isfinite(fd_pm_arr)
+    m2 = np.isfinite(fd_gt_arr) & np.isfinite(fd_h_arr)
+
+    fdmask_r2_pred = r2_score_np(fd_gt_arr[m1], fd_pm_arr[m1]) if np.sum(m1) >= 2 else np.nan
+    fdhead_r2_pred = r2_score_np(fd_gt_arr[m2], fd_h_arr[m2])  if np.sum(m2) >= 2 else np.nan
+
+    df = pd.DataFrame(rows)
+    return mean_dice, mean_iou, fdmask_r2_pred, fdhead_r2_pred, df, fd_gt_all, fd_predmask_all, fd_head_all
+
+
+# =========================
+# MAIN: TRAIN λ SWEEP + TEST
+# =========================
+def main():
+    set_seed(cfg.seed)
+    device = get_device()
+    print("Device:", device)
+
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    out_dir = os.path.join(cfg.out_root, f"{cfg.run_name}_{stamp}")
+    ensure_dir(out_dir)
+
+    # ---- Build TRAIN pairs + split ----
+    tr_img_paths_all, tr_mask_paths_all = build_pairs(cfg.train_images_dir, cfg.train_masks_dir)
+    tr_imgs, tr_msks, va_imgs, va_msks = split_by_image(
+        tr_img_paths_all, tr_mask_paths_all, cfg.val_ratio_images, cfg.seed
+    )
+
+    train_ds = TrainPatchDataset(tr_imgs, tr_msks, cfg.patch_size, cfg.patches_per_image)
+    val_ds = FullImageDataset(va_imgs, va_msks)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=cfg.batch_size, shuffle=True,
+        num_workers=cfg.num_workers, pin_memory=(device.type == "cuda")
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=1, shuffle=False,
+        num_workers=cfg.num_workers, pin_memory=(device.type == "cuda")
+    )
+
+    # ---- Build TEST pairs ----
+    test_img_paths, test_mask_paths = build_pairs(cfg.test_images_dir, cfg.test_masks_dir)
+    test_ds = FullImageDataset(test_img_paths, test_mask_paths)
+    test_loader = DataLoader(
+        test_ds, batch_size=1, shuffle=False,
+        num_workers=cfg.num_workers, pin_memory=(device.type == "cuda")
+    )
+
+    sweep_summary = []
+
+    for lam in cfg.lambda_list:
+        lam_tag = f"lambdaFD_{lam}".replace(".", "p")
+        lam_dir = os.path.join(out_dir, lam_tag)
+        ensure_dir(lam_dir)
+
+        print("\n" + "="*80)
+        print(f"START λFD={lam}  | saving to: {lam_dir}")
+        print("="*80)
+
+        model = ResNet34AttnUNetFD(
+            pretrained=cfg.pretrained, attention=cfg.attention, dropout=cfg.dropout
+        ).to(device)
+
+        # ✅ FIX: when λFD=0, freeze FD head parameters (clean baseline)
+        if lam == 0.0:
+            for p in model.fd_head.parameters():
+                p.requires_grad = False
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+        scheduler = make_scheduler(optimizer)
+
+        best_score = -1e9
+        best_epoch = 0
+        best_path = os.path.join(lam_dir, "best_model.pth")
+
+        history = []
+
+        for epoch in range(1, cfg.epochs + 1):
+            tr_L, tr_Lseg, tr_Lfd = train_one_epoch(model, train_loader, optimizer, device, lam)
+
+            val_dice, val_iou, val_fdmask_r2_pred, val_fdhead_r2_pred, _, _, _, _ = eval_on_full_images(
+                model, val_loader, device
+            )
+
+            # ✅ FIX: FD-head metrics are meaningless at λ=0 → set to NaN for clean plots
+            if lam == 0.0:
+                val_fdhead_r2_pred = np.nan
+
+            if cfg.scheduler.lower() == "plateau":
+                scheduler.step(val_dice)
+            else:
+                scheduler.step()
+
+            lr_now = optimizer.param_groups[0]["lr"]
+
+            history.append({
+                "epoch": epoch,
+                "lambda_fd": lam,
+                "train_loss_total": tr_L,
+                "train_loss_seg": tr_Lseg,
+                "train_loss_fd": tr_Lfd,
+                "val_dice": val_dice,
+                "val_iou": val_iou,
+                "val_fdmask_r2_pred": val_fdmask_r2_pred,
+                "val_fdhead_r2_pred": val_fdhead_r2_pred,
+                "lr": lr_now
+            })
+
+            crit = cfg.save_best_by.lower()
+            if crit == "fdmask_r2_pred":
+                score = val_fdmask_r2_pred if np.isfinite(val_fdmask_r2_pred) else -1e9
+            elif crit == "fdhead_r2_pred":
+                score = val_fdhead_r2_pred if np.isfinite(val_fdhead_r2_pred) else -1e9
+            else:
+                score = val_dice
+
+            if score > best_score:
+                best_score = score
+                best_epoch = epoch
+                torch.save({
+                    "model_state": model.state_dict(),
+                    "cfg": vars(cfg),
+                    "lambda_fd": lam,
+                    "epoch": epoch,
+                    "best_score": best_score
+                }, best_path)
+
+            if epoch == 1 or epoch % 5 == 0 or epoch == cfg.epochs:
+                print(
+                    f"[SL] [λFD={lam}] Epoch {epoch:03d} | "
+                    f"Train L={tr_L:.4f} (seg {tr_Lseg:.4f}, fd_l {tr_Lfd:.4f}) | "
+                    f"Val Dice={val_dice:.3f} IoU={val_iou:.3f} | "
+                    f"FDmask R²_pred={val_fdmask_r2_pred:.3f} "
+                    f"FDhead R²_pred={'nan' if not np.isfinite(val_fdhead_r2_pred) else f'{val_fdhead_r2_pred:.3f}'} | "
+                    f"lr={lr_now:.2e}"
+                )
+
+        # Save training history
+        hist_df = pd.DataFrame(history)
+        hist_df.to_csv(os.path.join(lam_dir, "training_history.csv"), index=False)
+
+        # Show + Save training curves in notebook
+        plot_training_curves(hist_df, lam, lam_dir, show=True)
+
+        # ---- TEST evaluation with best model ----
+        ckpt = torch.load(best_path, map_location=device)
+        model.load_state_dict(ckpt["model_state"])
+        model.to(device)
+
+        test_pred_dir = os.path.join(lam_dir, "test_predicted_masks")
+        test_comp_dir = os.path.join(lam_dir, "test_comparisons")
+
+        test_dice, test_iou, test_fdmask_r2_pred, test_fdhead_r2_pred, test_df, t_fd_gt, t_fd_pm, t_fd_head = eval_on_full_images(
+            model, test_loader, device,
+            save_pred_dir=test_pred_dir,
+            save_comp_dir=test_comp_dir
+        )
+
+        # ✅ FIX: FD-head test metric meaningless at λ=0
+        if lam == 0.0:
+            test_fdhead_r2_pred = np.nan
+
+        test_df.to_csv(os.path.join(lam_dir, "test_metrics_per_image.csv"), index=False)
+
+        # TEST correlation + BA plots (SAVE + DISPLAY inline)
+        mask_stats = scatter_regression_plot(
+            t_fd_gt, t_fd_pm,
+            title=f"TEST FD (Pred MASK vs GT) | λFD={lam}",
+            xlabel="FD (GT mask)", ylabel="FD (Pred mask)",
+            out_path=os.path.join(lam_dir, "test_FDmask_scatter.png"),
+            show=True
+        )
+        bland_altman_plot(
+            t_fd_gt, t_fd_pm,
+            title=f"TEST Bland–Altman (Pred MASK vs GT) | λFD={lam}",
+            out_path=os.path.join(lam_dir, "test_FDmask_blandaltman.png"),
+            show=True,
+            ylabel="FD difference (PredMask - GT)"
+        )
+
+        # ✅ Skip FD-head plots at λ=0 (clean baseline)
+        head_stats = None
+        if lam > 0:
+            head_stats = scatter_regression_plot(
+                t_fd_gt, t_fd_head,
+                title=f"TEST FD (FD-HEAD vs GT) | λFD={lam}",
+                xlabel="FD (GT mask)", ylabel="FD (FD-head pred)",
+                out_path=os.path.join(lam_dir, "test_FDhead_scatter.png"),
+                show=True
+            )
+            bland_altman_plot(
+                t_fd_gt, t_fd_head,
+                title=f"TEST Bland–Altman (FD-HEAD vs GT) | λFD={lam}",
+                out_path=os.path.join(lam_dir, "test_FDhead_blandaltman.png"),
+                show=True,
+                ylabel="FD difference (FDhead - GT)"
+            )
+
+        sweep_summary.append({
+            "lambda_fd": lam,
+            "best_epoch": best_epoch,
+            "best_score_used": best_score,
+            "test_mean_dice": test_dice,
+            "test_mean_iou": test_iou,
+            "test_fdmask_r2_pred": test_fdmask_r2_pred,
+            "test_fdhead_r2_pred": test_fdhead_r2_pred,
+            "test_FDmask_slope_a": (mask_stats["a"] if mask_stats else np.nan),
+            "test_FDmask_intercept_b": (mask_stats["b"] if mask_stats else np.nan),
+            "test_FDmask_r2_fit": (mask_stats["r2_fit"] if mask_stats else np.nan),
+            "test_FDmask_r2_pred_plot": (mask_stats["r2_pred"] if mask_stats else np.nan),
+            "test_FDhead_slope_a": (head_stats["a"] if head_stats else np.nan),
+            "test_FDhead_intercept_b": (head_stats["b"] if head_stats else np.nan),
+            "test_FDhead_r2_fit": (head_stats["r2_fit"] if head_stats else np.nan),
+            "test_FDhead_r2_pred_plot": (head_stats["r2_pred"] if head_stats else np.nan),
+        })
+
+        print(
+            f"\n[λFD={lam}] FINISHED | best_epoch={best_epoch} | "
+            f"TEST Dice={test_dice:.3f} IoU={test_iou:.3f} | "
+            f"FDmask R²_pred={test_fdmask_r2_pred:.3f} "
+            f"FDhead R²_pred={'nan' if not np.isfinite(test_fdhead_r2_pred) else f'{test_fdhead_r2_pred:.3f}'}\n"
+            f"Saved to: {lam_dir}"
+        )
+
+    # ---- Summary across lambdas ----
+    sum_df = pd.DataFrame(sweep_summary).sort_values("lambda_fd")
+    sum_csv = os.path.join(out_dir, "lambda_sweep_test_summary.csv")
+    sum_df.to_csv(sum_csv, index=False)
+
+    # λ effect plots (test): segmentation
+    plt.figure(figsize=(7,4))
+    plt.plot(sum_df["lambda_fd"], sum_df["test_mean_dice"], marker="o", label="Test Dice")
+    plt.plot(sum_df["lambda_fd"], sum_df["test_mean_iou"], marker="o", label="Test IoU")
+    plt.xlabel("λFD"); plt.ylabel("Metric")
+    plt.title("Effect of λFD on Test Segmentation Performance")
+    plt.legend(); plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "lambda_effect_test_seg.png"), dpi=300)
+    if display is not None: display(plt.gcf())
+    plt.close()
+
+    # λ effect plots (test): FD fidelity
+    plt.figure(figsize=(7,4))
+    plt.plot(sum_df["lambda_fd"], sum_df["test_fdmask_r2_pred"], marker="o", label="FD from Pred MASK (R²_pred)")
+    plt.plot(sum_df["lambda_fd"], sum_df["test_fdhead_r2_pred"], marker="o", label="FD-HEAD prediction (R²_pred)")
+    plt.xlabel("λFD"); plt.ylabel("R²_pred")
+    plt.title("Effect of λFD on Test FD Fidelity (Identity R²)")
+    plt.legend(); plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "lambda_effect_test_fd.png"), dpi=300)
+    if display is not None: display(plt.gcf())
+    plt.close()
+
+    print("\nDONE. All outputs saved to:", out_dir)
+    print("Summary CSV:", sum_csv)
+
+
+if __name__ == "__main__":
+    main()
